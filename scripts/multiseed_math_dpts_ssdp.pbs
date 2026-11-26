@@ -1,0 +1,507 @@
+#!/bin/bash -l
+#PBS -N multiseed_math
+#PBS -q preemptable
+#PBS -r y
+#PBS -A VeloC
+#PBS -l select=2:system=polaris:ngpus=4
+#PBS -l walltime=16:00:00
+#PBS -l filesystems=home:grand:eagle
+#PBS -l place=scatter
+
+set -euo pipefail
+
+cd "$PBS_O_WORKDIR"
+
+module use /soft/modulefiles
+
+# Keep the same environment setup as the working debug script.
+export SSDP_ENV=/home/atkia/.conda/envs/ssdp-paper
+export PATH="$SSDP_ENV/bin:$PATH"
+hash -r
+
+export HF_HOME=/lus/grand/projects/VeloC/atkia/hf_cache
+export TRANSFORMERS_CACHE="$HF_HOME"
+export HF_HUB_CACHE="$HF_HOME"
+export HUGGINGFACE_HUB_CACHE="$HF_HOME"
+
+export HF_TOKEN="$(cat "$HOME/.secrets/hf_token")"
+export HUGGINGFACE_HUB_TOKEN="$HF_TOKEN"
+
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export SENTENCE_TRANSFORMERS_HOME=/lus/grand/projects/VeloC/atkia/hf_cache/sentence_transformers
+
+REPO=/lus/grand/projects/VeloC/atkia/ssdp/SSDP
+cd "$REPO"
+
+# ============================================================================
+# ONLY THESE TWO USUALLY NEED TO CHANGE
+#
+# You can either edit them here, OR submit with:
+#   qsub -v METHOD=dpts,MODEL=llama-8b scripts/multiseed_math.pbs
+# ============================================================================
+METHOD="${METHOD:-dpts}"       # dpts | ssdp
+MODEL="${MODEL:-llama-8b}"    # llama-3b | llama-8b
+
+METHOD="${METHOD,,}"
+
+case "$METHOD" in
+  dpts)
+    DEFAULT_CONFIG="configs/inference/DPTS.json"
+    ;;
+  ssdp)
+    DEFAULT_CONFIG="configs/inference/SSDP.json"
+    ;;
+  *)
+    echo "[ERR] METHOD must be dpts or ssdp; got: $METHOD"
+    exit 2
+    ;;
+esac
+
+case "$MODEL" in
+  llama-3b|llama-8b)
+    ;;
+  *)
+    echo "[ERR] MODEL must be llama-3b or llama-8b; got: $MODEL"
+    exit 2
+    ;;
+esac
+
+CONFIG_FILE="${CONFIG_FILE:-$DEFAULT_CONFIG}"
+
+REWARD_MODEL="mistral_prm-7b"
+DATASET_NAME="math"
+EXPECTED_TOTAL=500
+BUDGETS=(3000 5000 8000 10000)
+
+# First seed is the old hard-coded main.py default, so seed_1029 is the
+# closest controlled reproduction of the previous single-run behavior.
+SEEDS=(12345 23456 34567)
+
+# Keep 500 to reproduce the current launcher. Can be overridden at qsub time:
+#   qsub -v CHUNK_SIZE=100,...
+CHUNK_SIZE="${CHUNK_SIZE:-500}"
+
+# ============================================================================
+# Collision-free directory hierarchy for all 4 experiment families:
+#
+# results/multiruns/math/
+#   dpts/
+#     llama-3b/
+#       seed_1029/ ...
+#       seed_2027/ ...
+#       seed_4099/ ...
+#       multiseed_accuracy.tsv
+#     llama-8b/ ...
+#   ssdp/
+#     llama-3b/ ...
+#     llama-8b/ ...
+#   master_multiseed_accuracy.tsv
+# ============================================================================
+MULTI_ROOT="$REPO/results/multiruns/math"
+COMBO_ROOT="$MULTI_ROOT/$REWARD_MODEL/$METHOD/$MODEL"
+LOGDIR="$COMBO_ROOT/logs"
+mkdir -p "$LOGDIR"
+
+PBSLOG="$LOGDIR/pbs.${METHOD}.${MODEL}.${PBS_JOBID}.log"
+exec > >(tee -a "$PBSLOG") 2>&1
+
+echo "===== MULTI-SEED MATH500 JOB ====="
+echo "JOBID:        $PBS_JOBID"
+echo "TIME:         $(date -Is)"
+echo "METHOD:       $METHOD"
+echo "MODEL:        $MODEL"
+echo "CONFIG:       $CONFIG_FILE"
+echo "REWARD_MODEL: $REWARD_MODEL"
+echo "SEEDS:        ${SEEDS[*]}"
+echo "BUDGETS:      ${BUDGETS[*]}"
+echo "CHUNK_SIZE:   $CHUNK_SIZE"
+echo "COMBO_ROOT:   $COMBO_ROOT"
+echo "=================================="
+
+if [[ ! -f "$CONFIG_FILE" ]]; then
+  echo "[ERR] config does not exist: $CONFIG_FILE"
+  exit 2
+fi
+
+if [[ ! -f "$REPO/scripts/aggregate_ssdp_chunks.py" ]]; then
+  echo "[ERR] missing aggregator: $REPO/scripts/aggregate_ssdp_chunks.py"
+  exit 2
+fi
+
+# Verify the seed-enabled main.py before burning GPU time.
+if ! python3 main.py --help 2>&1 | grep -q -- "--seed"; then
+  echo "[ERR] main.py does not expose --seed."
+  echo "      Apply the seed patch supplied with this PBS file first."
+  exit 2
+fi
+
+# ---------------------------------------------------------------------------
+# Worker launcher. mpiexec starts 4 workers = 2 nodes x 2 workers.
+# Each worker gets two local GPUs exactly as in the working debug launcher.
+# ---------------------------------------------------------------------------
+LAUNCHER="$LOGDIR/launch_multiseed_${PBS_JOBID}.sh"
+
+cat > "$LAUNCHER" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+RANK="${PMI_RANK:-0}"
+HOST="$(hostname)"
+SLOT=$(( RANK % 2 ))
+
+cd "$REPO"
+
+export BENCHMARK_ROOT='./benchmark'
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+
+if [[ "$SLOT" == "0" ]]; then
+  export CUDA_VISIBLE_DEVICES=0,1
+elif [[ "$SLOT" == "1" ]]; then
+  export CUDA_VISIBLE_DEVICES=2,3
+else
+  echo "[ERR] SLOT=$SLOT on $HOST"
+  exit 1
+fi
+
+# Capture launcher rank before hiding MPI variables from Accelerate.
+export SSDP_WORKER_RANK="$RANK"
+
+# PYTHONHASHSEED must exist before the Python interpreter starts.
+export PYTHONHASHSEED="$SSDP_SEED"
+
+# Same timing controls as the existing debug launcher.
+export SSDP_DEADLINE_S=$((24*3600 + 30*60))
+export SSDP_MIN_LEFT_S=1800
+
+# Hide the multinode launch from Accelerate, same as the existing script.
+unset PMI_RANK PMI_SIZE PMI_FD PMIX_RANK PMIX_SERVER_URI2 PMIX_SERVER_URI3
+unset OMPI_COMM_WORLD_RANK OMPI_COMM_WORLD_SIZE OMPI_COMM_WORLD_LOCAL_RANK
+unset MPI_LOCALRANKID MPI_LOCALNRANKS MPICH_RANK MPICH_LOCAL_RANK MPICH_WORLD_SIZE
+unset MASTER_ADDR MASTER_PORT RANK WORLD_SIZE LOCAL_RANK
+
+RUNLOG="$LOGDIR/${METHOD}.${MODEL}.seed${SSDP_SEED}.w${SSDP_WORKER_RANK}.${PBS_JOBID}.${HOST}.log"
+
+{
+  echo "[START] $(date -Is) method=$METHOD model=$MODEL seed=$SSDP_SEED host=$HOST rank=$SSDP_WORKER_RANK gpus=$CUDA_VISIBLE_DEVICES"
+  echo "[PATHS] results=$SSDP_RESULTS qdir=$SSDP_QDIR config=$CONFIG_FILE"
+
+  python3 -u main.py \
+    --config "$CONFIG_FILE" \
+    --work-dir "$SSDP_RESULTS" \
+    --data "$DATASET_NAME" \
+    --model "$MODEL" \
+    --reward_model "$REWARD_MODEL" \
+    --dtype bfloat16 \
+    --seed "$SSDP_SEED"
+
+  rc=$?
+  echo "[END] $(date -Is) rc=$rc"
+  exit "$rc"
+} > "$RUNLOG" 2>&1
+EOF
+
+chmod +x "$LAUNCHER"
+
+# Shared variables used by the worker launcher.
+export REPO LOGDIR METHOD MODEL CONFIG_FILE REWARD_MODEL DATASET_NAME
+
+# ---------------------------------------------------------------------------
+# Seed loop
+# ---------------------------------------------------------------------------
+for SEED in "${SEEDS[@]}"; do
+  echo
+  echo "======================================================================"
+  echo "[SEED] $SEED | method=$METHOD model=$MODEL | $(date -Is)"
+  echo "======================================================================"
+
+  SEED_ROOT="$COMBO_ROOT/seed_${SEED}"
+
+  # main.py expects RESULTS/<MODEL>/b<BUDGET>/...
+  SSDP_RESULTS="$SEED_ROOT"
+
+  # Queue is seed-specific. Therefore done/claim markers can never leak from
+  # one seed into another seed.
+  SSDP_QDIR="$SEED_ROOT/_queue/${MODEL}_${DATASET_NAME}"
+
+  mkdir -p "$SSDP_QDIR/claim" "$SSDP_QDIR/done"
+
+  # Build this seed's queue once. Persistent chunks + done markers make the
+  # whole PBS script restart/resubmission safe.
+  if [[ ! -f "$SSDP_QDIR/chunks.txt" ]]; then
+    : > "$SSDP_QDIR/chunks.txt"
+
+    for B in "${BUDGETS[@]}"; do
+      s=0
+      while [[ $s -lt $EXPECTED_TOTAL ]]; do
+        e=$(( s + CHUNK_SIZE ))
+        [[ $e -gt $EXPECTED_TOTAL ]] && e=$EXPECTED_TOTAL
+        printf "b%05d_%03d %d %d %d\n" "$B" "$s" "$B" "$s" "$e" >> "$SSDP_QDIR/chunks.txt"
+        s=$e
+      done
+    done
+
+    echo "[QUEUE] seed=$SEED built $(wc -l < "$SSDP_QDIR/chunks.txt") chunks"
+  fi
+
+  # Claims may be stale after a preemption. Done markers are intentionally kept.
+  rm -rf "$SSDP_QDIR/claim"
+  mkdir -p "$SSDP_QDIR/claim"
+
+  EXPECTED_CHUNKS=$(wc -l < "$SSDP_QDIR/chunks.txt")
+  DONE_CHUNKS=$(find "$SSDP_QDIR/done" -maxdepth 1 -type f | wc -l)
+
+  echo "[QUEUE] seed=$SEED done=$DONE_CHUNKS/$EXPECTED_CHUNKS"
+
+  export SSDP_SEED="$SEED"
+  export SSDP_QDIR SSDP_RESULTS
+
+  if [[ "$DONE_CHUNKS" -lt "$EXPECTED_CHUNKS" ]]; then
+    echo "[LAUNCH] seed=$SEED -> 4 workers (2 nodes x 2)"
+    mpiexec -n 4 --ppn 2 "$LAUNCHER"
+  else
+    echo "[SKIP] seed=$SEED already has every expected chunk done"
+  fi
+
+  # Hard completeness gate. Never aggregate/average a partial seed.
+  DONE_CHUNKS=$(find "$SSDP_QDIR/done" -maxdepth 1 -type f | wc -l)
+  if [[ "$DONE_CHUNKS" -ne "$EXPECTED_CHUNKS" ]]; then
+    echo "[ERR] seed=$SEED incomplete: done=$DONE_CHUNKS expected=$EXPECTED_CHUNKS"
+    echo "[ERR] stopping here. Re-qsub the same METHOD/MODEL; completed chunks will be reused."
+    exit 3
+  fi
+
+  # -------------------------------------------------------------------------
+  # Existing shard aggregation: merge chunks, evaluate majority vote, report
+  # token usage + candidate Top1..Top10 exactly as your current aggregator does.
+  # -------------------------------------------------------------------------
+  AGG_LOG="$SEED_ROOT/aggregate.log"
+
+  echo "[AGG] seed=$SEED -> $AGG_LOG"
+  python3 -u scripts/aggregate_ssdp_chunks.py \
+    --results "$SSDP_RESULTS" \
+    --model "$MODEL" \
+    --qdir "$SSDP_QDIR" \
+    --data "$DATASET_NAME" \
+    --budgets "${BUDGETS[@]}" \
+    --expected-total "$EXPECTED_TOTAL" \
+    2>&1 | tee "$AGG_LOG"
+
+  # Check that the aggregator actually produced a complete majority-vote row
+  # for all four budgets before proceeding to the next seed.
+  export AGG_LOG EXPECTED_TOTAL
+  python3 - <<'PY'
+import os
+import re
+from pathlib import Path
+
+path = Path(os.environ["AGG_LOG"])
+expected = int(os.environ["EXPECTED_TOTAL"])
+text = path.read_text(errors="replace")
+
+pat = re.compile(
+    r"^\[b(\d+)\]\s+majority_vote\s+(\d+)\s+([0-9.]+)\s+(\d+)\s+(\d+)\s*$",
+    re.MULTILINE,
+)
+
+rows = {int(b): (int(n), float(acc), int(correct), int(no_match))
+        for b, n, acc, correct, no_match in pat.findall(text)}
+
+wanted = {3000, 5000, 8000, 10000}
+missing = wanted - set(rows)
+
+if missing:
+    raise SystemExit(f"[ERR] aggregate log missing majority_vote budgets: {sorted(missing)}")
+
+bad = {b: rows[b][0] for b in wanted if rows[b][0] != expected}
+if bad:
+    raise SystemExit(f"[ERR] aggregate rows are not full Math500 runs: {bad}")
+
+print("[AGG-CHECK] all four majority_vote rows contain 500 samples")
+PY
+
+  echo "[SEED] complete seed=$SEED at $(date -Is)"
+done
+
+# ===========================================================================
+# Cross-seed aggregation
+# ===========================================================================
+export MULTI_ROOT COMBO_ROOT METHOD MODEL EXPECTED_TOTAL
+SEEDS_CSV="$(IFS=,; echo "${SEEDS[*]}")"
+BUDGETS_CSV="$(IFS=,; echo "${BUDGETS[*]}")"
+export SEEDS_CSV BUDGETS_CSV
+
+python3 - <<'PY'
+import csv
+import os
+import re
+import statistics
+from pathlib import Path
+
+root = Path(os.environ["COMBO_ROOT"])
+multi_root = Path(os.environ["MULTI_ROOT"])
+method = os.environ["METHOD"]
+model = os.environ["MODEL"]
+expected = int(os.environ["EXPECTED_TOTAL"])
+seeds = [int(x) for x in os.environ["SEEDS_CSV"].split(",")]
+budgets = [int(x) for x in os.environ["BUDGETS_CSV"].split(",")]
+
+# Parse exact correct/n from the existing aggregator's majority_vote rows.
+pat = re.compile(
+    r"^\[b(\d+)\]\s+majority_vote\s+(\d+)\s+([0-9.]+)\s+(\d+)\s+(\d+)\s*$",
+    re.MULTILINE,
+)
+
+per_seed = {}  # (budget, seed) -> {n, correct, acc_pct}
+
+for seed in seeds:
+    log = root / f"seed_{seed}" / "aggregate.log"
+    if not log.exists():
+        raise SystemExit(f"missing aggregate log: {log}")
+
+    rows = pat.findall(log.read_text(errors="replace"))
+    parsed = {
+        int(b): {
+            "n": int(n),
+            "reported_acc": float(acc),
+            "correct": int(correct),
+            "no_match": int(no_match),
+        }
+        for b, n, acc, correct, no_match in rows
+    }
+
+    for budget in budgets:
+        if budget not in parsed:
+            raise SystemExit(f"seed={seed}: missing majority_vote budget={budget}")
+        row = parsed[budget]
+        if row["n"] != expected:
+            raise SystemExit(
+                f"seed={seed} budget={budget}: n={row['n']} expected={expected}"
+            )
+
+        # Compute from integer counts, not from a rounded printed percentage.
+        acc_pct = 100.0 * row["correct"] / row["n"]
+        per_seed[(budget, seed)] = {
+            "n": row["n"],
+            "correct": row["correct"],
+            "accuracy_pct": acc_pct,
+        }
+
+# Long-form per-seed file.
+per_seed_path = root / "per_seed_accuracy.tsv"
+with per_seed_path.open("w", newline="") as f:
+    w = csv.writer(f, delimiter="\t")
+    w.writerow(["method", "model", "budget_tokens", "seed",
+                "correct", "total", "accuracy_pct"])
+    for budget in budgets:
+        for seed in seeds:
+            r = per_seed[(budget, seed)]
+            w.writerow([
+                method, model, budget, seed, r["correct"], r["n"],
+                f"{r['accuracy_pct']:.6f}"
+            ])
+
+# One row per paper cell: three seed accuracies + mean/std.
+summary_rows = []
+for budget in budgets:
+    xs = [per_seed[(budget, seed)]["accuracy_pct"] for seed in seeds]
+    mean = statistics.mean(xs)
+    # Sample SD across the three independent seed-level runs (n-1).
+    sd = statistics.stdev(xs) if len(xs) > 1 else 0.0
+
+    row = {
+        "method": method,
+        "model": model,
+        "budget_tokens": budget,
+        **{f"seed_{seed}_accuracy_pct": x for seed, x in zip(seeds, xs)},
+        "mean_accuracy_pct": mean,
+        "std_accuracy_pct": sd,
+    }
+    summary_rows.append(row)
+
+summary_path = root / "multiseed_accuracy.tsv"
+seed_cols = [f"seed_{s}_accuracy_pct" for s in seeds]
+fields = ["method", "model", "budget_tokens", *seed_cols,
+          "mean_accuracy_pct", "std_accuracy_pct"]
+
+with summary_path.open("w", newline="") as f:
+    w = csv.DictWriter(f, fieldnames=fields, delimiter="\t")
+    w.writeheader()
+    for row in summary_rows:
+        out = dict(row)
+        for c in seed_cols + ["mean_accuracy_pct", "std_accuracy_pct"]:
+            out[c] = f"{float(out[c]):.6f}"
+        w.writerow(out)
+
+print()
+print("================ MATH500 MULTI-SEED RESULTS ================")
+print(f"Method={method.upper()}   Model={model}")
+seed_header = "  ".join(f"seed{s:>5}" for s in seeds)
+print(f"{'Budget':>8}  {seed_header}  {'Mean ± SD (%)':>18}")
+print("-" * (32 + 11 * len(seeds)))
+
+for row in summary_rows:
+    vals = [row[f"seed_{s}_accuracy_pct"] for s in seeds]
+    seed_text = "  ".join(f"{x:>8.2f}" for x in vals)
+    print(
+        f"{row['budget_tokens']:>8}  {seed_text}  "
+        f"{row['mean_accuracy_pct']:>7.2f} ± {row['std_accuracy_pct']:<7.2f}"
+    )
+
+print("-" * (32 + 11 * len(seeds)))
+print(f"Per-seed TSV : {per_seed_path}")
+print(f"Mean/std TSV : {summary_path}")
+print("SD = sample standard deviation across the three seed-level accuracies.")
+print("=============================================================")
+
+# -------------------------------------------------------------------------
+# Update one master table spanning all four jobs:
+# DPTS/SSDP x llama-3b/llama-8b.
+# Existing rows for this same method/model are replaced, so reruns are safe.
+# -------------------------------------------------------------------------
+master_path = multi_root / "master_multiseed_accuracy.tsv"
+existing = []
+
+if master_path.exists():
+    with master_path.open() as f:
+        reader = csv.DictReader(f, delimiter="\t")
+        # Only preserve rows that use this same seed-column schema.
+        if reader.fieldnames == fields:
+            for r in reader:
+                if not (r["method"] == method and r["model"] == model):
+                    existing.append(r)
+
+for row in summary_rows:
+    out = dict(row)
+    for c in seed_cols + ["mean_accuracy_pct", "std_accuracy_pct"]:
+        out[c] = f"{float(out[c]):.6f}"
+    existing.append(out)
+
+method_order = {"dpts": 0, "ssdp": 1}
+model_order = {"llama-3b": 0, "llama-8b": 1}
+existing.sort(
+    key=lambda r: (
+        method_order.get(r["method"], 99),
+        model_order.get(r["model"], 99),
+        int(r["budget_tokens"]),
+    )
+)
+
+master_path.parent.mkdir(parents=True, exist_ok=True)
+with master_path.open("w", newline="") as f:
+    w = csv.DictWriter(f, fieldnames=fields, delimiter="\t")
+    w.writeheader()
+    w.writerows(existing)
+
+print(f"Master 4-combo table updated: {master_path}")
+PY
+
+echo
+echo "[DONE] $(date -Is)"
+echo "[DONE] method=$METHOD model=$MODEL"
+echo "[DONE] combo summary: $COMBO_ROOT/multiseed_accuracy.tsv"
+echo "[DONE] global master: $MULTI_ROOT/master_multiseed_accuracy.tsv"
+

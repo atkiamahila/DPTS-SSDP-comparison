@@ -1,0 +1,110 @@
+#!/bin/bash -l
+#PBS -N ssdp_single_2gpu
+#PBS -q debug
+#PBS -r y
+#PBS -A VeloC
+#PBS -l select=1:system=polaris
+#PBS -l walltime=00:30:00
+#PBS -l filesystems=home:grand:eagle
+
+set -euo pipefail
+
+cd "$PBS_O_WORKDIR"
+
+LOGDIR="$PBS_O_WORKDIR/runlogs"
+mkdir -p "$LOGDIR"
+
+PBSLOG="$LOGDIR/ssdp_single.${PBS_JOBID}.log"
+exec > >(tee -a "$PBSLOG") 2>&1
+
+echo "[LOG]   $PBSLOG"
+echo "[JOBID] $PBS_JOBID"
+echo "[TIME]  $(date -Is)"
+echo "[HOST]  $(hostname)"
+echo "[PWD]   $(pwd)"
+
+# -------- modules / env --------
+module use /soft/modulefiles
+module load conda
+conda activate ssdp-paper
+
+# -------- HF cache --------
+export HF_HOME=/lus/grand/projects/VeloC/atkia/hf_cache
+export TRANSFORMERS_CACHE="$HF_HOME"
+export HF_HUB_CACHE="$HF_HOME"
+export HUGGINGFACE_HUB_CACHE="$HF_HOME"
+
+if [ -f "$HOME/.secrets/hf_token" ]; then
+  export HF_TOKEN="$(cat $HOME/.secrets/hf_token)"
+  export HUGGINGFACE_HUB_TOKEN="$HF_TOKEN"
+fi
+
+# -------- CPU thread limits --------
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+
+# -------- repo --------
+REPO=/lus/grand/projects/VeloC/atkia/ssdp/SSDP
+cd "$REPO"
+
+echo "[PWD] $(pwd)"
+
+# -------- experiment config --------
+CFG="configs/inference/DPTS.json"
+MODEL="llama-8b"
+EXP="DPTS_math_llama-8b_2gpu"
+TAG="llama-8b_DPTS"
+
+DATASET_NAME="math"
+REWARD_MODEL="qwen_prm-7b"
+
+# -------- output paths --------
+RUNLOG="$LOGDIR/${TAG}.${PBS_JOBID}.log"
+TRACE_DIR="./results/${MODEL}/${EXP}/${PBS_JOBID}_traces"
+WORK_DIR="./results"
+
+mkdir -p "./results/${MODEL}/${EXP}"
+mkdir -p "$TRACE_DIR"
+
+# -------- GPU selection (2 GPUs) --------
+export CUDA_VISIBLE_DEVICES=0,1
+
+echo "[CUDA_VISIBLE_DEVICES] $CUDA_VISIBLE_DEVICES"
+
+# -------- debug GPU visibility --------
+python3 - <<'PY'
+import os, torch
+print("CUDA_VISIBLE_DEVICES =", os.environ.get("CUDA_VISIBLE_DEVICES"))
+print("torch.cuda.is_available() =", torch.cuda.is_available())
+print("torch.cuda.device_count() =", torch.cuda.device_count())
+for i in range(torch.cuda.device_count()):
+    print(f"visible cuda:{i} ->", torch.cuda.get_device_name(i))
+PY
+
+# -------- run experiment --------
+{
+  echo "[START] $(date -Is)"
+
+  python3 -u main.py \
+    --config "$CFG" \
+    --work-dir "$WORK_DIR" \
+    --exp-name "$EXP" \
+    --data "$DATASET_NAME" \
+    --model "$MODEL" \
+    --reward_model "$REWARD_MODEL" \
+    --trace-log-dir "$TRACE_DIR" \
+    --dtype bfloat16 \
+    --debug
+
+  RC=$?
+  echo "[END] $(date -Is) rc=$RC"
+  exit $RC
+
+} > "$RUNLOG" 2>&1
+
+RC=$?
+echo "[DONE] $(date -Is) rc=$RC"
+exit $RC

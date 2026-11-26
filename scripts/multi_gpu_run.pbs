@@ -1,0 +1,181 @@
+#!/bin/bash -l
+#PBS -N ssdp_multi_gpu
+#PBS -q preemptable
+#PBS -r y
+#PBS -A VeloC
+#PBS -l select=1:system=polaris:ngpus=4
+#PBS -l walltime=04:30:00
+#PBS -l filesystems=home:grand:eagle
+#PBS -l place=scatter
+
+set -euo pipefail
+
+# ---- logs go where you qsub from ----
+cd "$PBS_O_WORKDIR"
+LOGDIR="$PBS_O_WORKDIR/runlogs"
+mkdir -p "$LOGDIR"
+PBSLOG="$LOGDIR/ssdp_multi_gpu.${PBS_JOBID}.log"
+exec > >(tee -a "$PBSLOG") 2>&1
+ echo "[LOG] $PBSLOG"
+ echo "JOBID: $PBS_JOBID"
+ echo "NODE:  $(hostname)"
+ echo "TIME:  $(date -Is)"
+
+# ---- startup environment ----
+module use /soft/modulefiles
+module load conda
+conda activate ssdp-paper
+
+export HF_HOME=/lus/grand/projects/VeloC/atkia/hf_cache
+export TRANSFORMERS_CACHE="$HF_HOME"
+export HF_HUB_CACHE="$HF_HOME"
+export HUGGINGFACE_HUB_TOKEN="$(cat $HOME/.secrets/hf_token)"
+
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+
+export NCCL_DEBUG=INFO
+export TORCH_DISTRIBUTED_DEBUG=DETAIL
+export NCCL_IB_DISABLE=1
+export NCCL_P2P_DISABLE=1
+# Optional: keep CPU threads under control
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+
+# Go to repo and run the multi-gpu script
+REPO=/lus/grand/projects/VeloC/atkia/ssdp/SSDP
+cd "$REPO/scripts"
+echo "[PWD] $(pwd)"
+# detect how many GPUs were allocated (PBS doesn't export that directly)
+# fall back to nvidia-smi
+GPU_COUNT=$(nvidia-smi --list-gpus 2>/dev/null | wc -l)
+if [ -z "$GPU_COUNT" ] || [ "$GPU_COUNT" -le 0 ]; then
+		echo "WARNING: unable to detect GPUs, defaulting to 1"
+		GPU_COUNT=1
+fi
+echo "Allocated GPUs: $GPU_COUNT"
+
+# How many GPUs to give *per* experiment. Default 2 (so each experiment can use 2 GPUs).
+# You can override by exporting GPUS_PER_EXPT or setting before qsub.
+GPUS_PER_EXPT=${GPUS_PER_EXPT:-2}
+# When USE_TORCHRUN=1 we'll attempt to launch experiments using torch.distributed (`torchrun`).
+USE_TORCHRUN=${USE_TORCHRUN:-1}
+echo "GPUs per experiment: $GPUS_PER_EXPT  (USE_TORCHRUN=$USE_TORCHRUN)"
+
+# How many GPUs to give *per* experiment. Default 2 (so each experiment can use 2 GPUs).
+# You can override by exporting GPUS_PER_EXPT or setting before qsub.
+GPUS_PER_EXPT=${GPUS_PER_EXPT:-2}
+# When USE_TORCHRUN=1 we'll attempt to launch experiments using torch.distributed (`torchrun`).
+USE_TORCHRUN=${USE_TORCHRUN:-1}
+echo "GPUs per experiment: $GPUS_PER_EXPT  (USE_TORCHRUN=$USE_TORCHRUN)"
+
+# for now we only run two processes, each using two GPUs, and only the
+# llama-3b model. Experiments: DPTS vs SSDP on math.
+
+# only use 2 entries (DPTS and SSDP) both with llama-3b
+configs=("configs/inference/DPTS.json" "configs/inference/SSDP.json")
+models=("llama-3b" "llama-3b")
+expnames=("DPTS_MATH_llama-3b" "SSDP_MATH_llama-3b")
+tags=("llama-3b_DPTS" "llama-3b_SSDP")
+
+run_one () {
+    local gpu_list="$1"   # comma-separated list of GPUs
+    local cfg_rel="$2"     # e.g., configs/inference/DPTS.json
+    local model="$3"       # e.g., llama-3b
+    local exp_name="$4"    # e.g., DPTS_MATH_llama-3b
+    local tag="$5"         # for log filename
+
+    # include gpu list in log file name
+    local gpu_tag=$(echo $gpu_list | tr ',' '_')
+    local runlog="$LOGDIR/${tag}.${PBS_JOBID}.gpus${gpu_tag}.log"
+
+    echo "[RUN] gpus=$gpu_list cfg=$cfg_rel model=$model exp=$exp_name log=$runlog at $(date -Is)"
+
+    (
+        export CUDA_VISIBLE_DEVICES="$gpu_list"
+        WORKSPACE=../
+        cd "$WORKSPACE"
+        export BENCHMARK_ROOT='./benchmark'
+        export GPU=1
+        export CUDA_DEVICE_ORDER=PCI_BUS_ID
+
+        work_dir=./results
+        mkdir -p "./results/${model}/${exp_name}"
+
+        trace_dir="./results/${model}/${exp_name}/${PBS_JOBID}_traces"
+        mkdir -p "$trace_dir"
+
+        DATASET_NAME=math
+        MODEL_NAME="$model"
+        REWARD_MODEL=mistral_prm-7b
+
+        # Diagnostic: confirm visible devices & per-process view written to runlog
+        python3 - <<'PY' >> "$runlog" 2>&1
+import os
+print('[DIAG] CUDA_VISIBLE_DEVICES=', os.environ.get('CUDA_VISIBLE_DEVICES'))
+try:
+    import torch
+    print('[DIAG] torch.cuda.device_count()=', torch.cuda.device_count())
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            try:
+                print('[DIAG] dev', i, torch.cuda.get_device_name(i))
+            except Exception as e:
+                print('[DIAG] dev', i, 'name_error', e)
+except Exception as e:
+    print('[DIAG] torch import failed:', e)
+PY
+
+        if [ "$USE_TORCHRUN" -eq 1 ]; then
+            echo "[RUN] launching with torchrun --nproc_per_node=${GPUS_PER_EXPT}" >> "$runlog"
+            torchrun --nproc_per_node=${GPUS_PER_EXPT} --master_port=29501 main.py \
+                --config "$cfg_rel" \
+                --work-dir "$work_dir" \
+                --exp-name "$exp_name" \
+                --data "$DATASET_NAME" \
+                --model "$MODEL_NAME" \
+                --trace-log-dir "$trace_dir" \
+                --reward_model "$REWARD_MODEL" \
+                --dtype bfloat16 \
+                --fast_mode \
+                --debug
+        else
+            python3 -u main.py \
+                --config "$cfg_rel" \
+                --work-dir "$work_dir" \
+                --exp-name "$exp_name" \
+                --data "$DATASET_NAME" \
+                --model "$MODEL_NAME" \
+                --trace-log-dir "$trace_dir" \
+                --reward_model "$REWARD_MODEL" \
+                --dtype bfloat16 \
+                --fast_mode \
+                --debug
+        fi
+    ) > "$runlog" 2>&1
+}
+
+# launch two-GPU processes; number of processes is floor(GPU_COUNT/2)
+procs=$(( GPU_COUNT / 2 ))
+if [ $procs -lt 1 ]; then procs=1; fi
+for (( i=0; i<procs; i++ )); do
+	g0=$(( (2*i) % GPU_COUNT ))
+	g1=$(( (2*i+1) % GPU_COUNT ))
+	gpu_list="${g0},${g1}"
+	idx=$(( i % ${#configs[@]} ))
+	run_one "$gpu_list" "${configs[$idx]}" "${models[$idx]}" "${expnames[$idx]}" "${tags[$idx]}" &
+	pids[$i]=$!
+done
+
+echo "[PIDS] ${pids[*]}"
+
+FAIL=0
+for pid in "${pids[@]}"; do
+		wait "$pid" || FAIL=1
+done
+
+echo "[DONE] $(date -Is) fail=$FAIL"
+exit "$FAIL"
+
+# done

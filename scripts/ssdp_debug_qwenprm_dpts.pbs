@@ -1,0 +1,144 @@
+#!/bin/bash -l
+#PBS -N qwen_dpts_3b
+#PBS -q debug
+#PBS -A VeloC
+#PBS -l select=2:system=polaris
+#PBS -l walltime=01:00:00
+#PBS -l filesystems=home:grand
+
+set -euo pipefail
+
+REPO=/lus/grand/projects/VeloC/atkia/ssdp/SSDP
+cd "$REPO"
+
+MODEL="llama-3b"              # generator (fixed across PRM conditions)
+REWARD_MODEL="qwen_prm-7b"    # PRM under test
+DATASET_NAME="math"
+CONFIG="configs/inference/DPTS.json"
+EXP_NAME="${MODEL}_${REWARD_MODEL}_${DATASET_NAME}_dpts"
+WORK_DIR="$REPO/results"
+
+LOGDIR="${PBS_O_WORKDIR:-$REPO}/runlogs"
+mkdir -p "$LOGDIR"
+
+JOBTAG="${PBS_JOBID:-interactive_$(date +%Y%m%d_%H%M%S)}"
+MAINLOG="$LOGDIR/ssdp_qwenprm_dpts.${JOBTAG}.log"
+exec > >(tee -a "$MAINLOG") 2>&1
+
+echo "===== SSDP QWEN-PRM DPTS (debug queue, 2 nodes x 8 GPU) ====="
+echo "JOBTAG:    $JOBTAG"
+echo "MODEL:     $MODEL"
+echo "REWARD:    $REWARD_MODEL"
+echo "DATA:      $DATASET_NAME"
+echo "EXP_NAME:  $EXP_NAME"
+echo "TIME:      $(date -Is)"
+echo "=============================================================="
+
+ml use /soft/modulefiles
+ml spack-pe-base
+ml apptainer 2>/dev/null || true
+
+export CACHE_ROOT=/lus/grand/projects/VeloC/atkia/hf_cache
+export HF_HOME=$CACHE_ROOT/hf
+export TRANSFORMERS_CACHE=$CACHE_ROOT/hf
+export HUGGINGFACE_HUB_CACHE=$CACHE_ROOT/hf/hub
+export HF_HUB_CACHE=$CACHE_ROOT/hf/hub
+export TORCH_HOME=$CACHE_ROOT/torch
+export TRITON_CACHE_DIR=$CACHE_ROOT/triton
+mkdir -p "$CACHE_ROOT"/{hf,torch,triton}
+
+if [ -f "$HOME/.secrets/hf_token" ]; then
+  export HF_TOKEN="$(cat "$HOME/.secrets/hf_token")"
+  export HUGGINGFACE_HUB_TOKEN="$HF_TOKEN"
+fi
+
+export http_proxy="http://proxy.alcf.anl.gov:3128"
+export https_proxy="http://proxy.alcf.anl.gov:3128"
+export HTTP_PROXY="$http_proxy"
+export HTTPS_PROXY="$https_proxy"
+
+sort -u "$PBS_NODEFILE" > "$LOGDIR/hosts.${JOBTAG}.all"
+NNODES=$(wc -l < "$LOGDIR/hosts.${JOBTAG}.all")
+echo "[NODES] $NNODES node(s):"
+cat "$LOGDIR/hosts.${JOBTAG}.all"
+
+export no_proxy="localhost,127.0.0.1,.cm.polaris.alcf.anl.gov,.polaris.alcf.anl.gov,.alcf.anl.gov"
+export NO_PROXY="$no_proxy"
+
+source /lus/grand/projects/VeloC/atkia/tot_fastTree/fastTree_polaris_env.sh 2>/dev/null || true
+conda activate ssdp-paper 2>/dev/null || true
+
+# --------------------------------------------------------------------------
+# 8 GPUs total across 2 nodes (4 per node). Launch one worker per GPU. Each
+# worker calls run_resumable.py, which picks up remaining samples from the
+# SAME output_dir every time (no timestamp drift), so simply resubmitting
+# this PBS script after walltime expiry continues where it left off.
+#
+# NOTE: run_resumable.py currently loads the FULL dataset and computes
+# remaining indices independently per process - if you run >1 worker
+# against the SAME exp-name concurrently they will race on the same
+# RESUME_*.json / output_dir. For safe parallelism across 8 GPUs, give
+# each GPU worker its own exp-name / output_dir shard of the dataset
+# (e.g. by index range), then combine at the end. Adjust SHARD_STARTS
+# below to match how you want the 500 problems split across 8 workers.
+# --------------------------------------------------------------------------
+
+GPUS_PER_NODE=4
+TOTAL_GPUS=8
+NUM_SAMPLES=500
+SHARD_SIZE=$(( (NUM_SAMPLES + TOTAL_GPUS - 1) / TOTAL_GPUS ))
+
+mapfile -t NODES < "$LOGDIR/hosts.${JOBTAG}.all"
+
+WORKER=0
+PIDS=()
+for NODE_IDX in "${!NODES[@]}"; do
+  NODE="${NODES[$NODE_IDX]}"
+  for LOCAL_GPU in $(seq 0 $((GPUS_PER_NODE - 1))); do
+    SHARD_START=$(( WORKER * SHARD_SIZE ))
+    SHARD_END=$(( SHARD_START + SHARD_SIZE ))
+    [ "$SHARD_END" -gt "$NUM_SAMPLES" ] && SHARD_END=$NUM_SAMPLES
+
+    if [ "$SHARD_START" -lt "$NUM_SAMPLES" ]; then
+      WORKER_EXP_NAME="${EXP_NAME}_shard${WORKER}"
+      WORKER_LOG="$LOGDIR/worker_${WORKER}.${JOBTAG}.log"
+
+      echo "[LAUNCH] worker=$WORKER node=$NODE gpu=$LOCAL_GPU shard=[$SHARD_START,$SHARD_END) exp=$WORKER_EXP_NAME"
+      mpiexec --hosts "$NODE" -n 1 --ppn 1 \
+  	--env CUDA_VISIBLE_DEVICES="$LOCAL_GPU" \
+  	--env HF_HOME="$HF_HOME" \
+  	--env TRANSFORMERS_CACHE="$TRANSFORMERS_CACHE" \
+  	--env HUGGINGFACE_HUB_CACHE="$HUGGINGFACE_HUB_CACHE" \
+ 	--env HF_HUB_CACHE="$HF_HUB_CACHE" \
+  	--env TORCH_HOME="$TORCH_HOME" \
+ 	--env TRITON_CACHE_DIR="$TRITON_CACHE_DIR" \
+  	--env http_proxy="$http_proxy" --env https_proxy="$https_proxy" \
+  	--env HTTP_PROXY="$HTTP_PROXY" --env HTTPS_PROXY="$HTTPS_PROXY" \
+  	--env no_proxy="$no_proxy" --env NO_PROXY="$NO_PROXY" \
+  	--env PYTHONPATH="$REPO" \
+  	bash -lc "source ~/.bashrc; conda activate ssdp-paper; cd $REPO && \
+    	python -u scripts/run_resumable.py \
+    	--data $DATASET_NAME \
+    	--model $MODEL \
+    	--reward_model $REWARD_MODEL \
+    	-c $CONFIG \
+    	--work-dir $WORK_DIR \
+    	--exp-name $WORKER_EXP_NAME \
+   	--shard-start $SHARD_START \
+    	--shard-end $SHARD_END" \
+  	> "$WORKER_LOG" 2>&1 &
+	PIDS+=($!)
+    fi
+    WORKER=$((WORKER + 1))
+  done
+done
+
+echo "[WAIT] waiting on ${#PIDS[@]} worker(s): ${PIDS[*]}"
+wait "${PIDS[@]}"
+
+echo "[DONE] all launched shard workers finished or hit walltime."
+echo "[NOTE] check per-worker logs in: $LOGDIR/worker_*.${JOBTAG}.log"
+echo "[NOTE] resubmit this same script to continue any unfinished shards -"
+echo "       run_resumable.py resumes each shard's exp-name from its own"
+echo "       latest RESUME_*.json automatically."
+

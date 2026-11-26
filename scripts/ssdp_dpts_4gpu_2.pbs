@@ -1,0 +1,115 @@
+#!/bin/bash -l
+#PBS -N ssdp_dpts_4gpu
+#PBS -q preemptable
+#PBS -r y
+#PBS -A VeloC
+#PBS -l select=1:system=polaris:ngpus=4
+#PBS -l walltime=04:30:00
+#PBS -l filesystems=home:grand:eagle
+#PBS -l place=scatter
+
+set -euo pipefail
+
+# ---- logs go where you qsub from ----
+cd "$PBS_O_WORKDIR"
+LOGDIR="$PBS_O_WORKDIR/runlogs"
+mkdir -p "$LOGDIR"
+PBSLOG="$LOGDIR/ssdp_dpts_4gpu.${PBS_JOBID}.log"
+exec > >(tee -a "$PBSLOG") 2>&1
+echo "[LOG] $PBSLOG"
+echo "JOBID: $PBS_JOBID"
+echo "NODE:  $(hostname)"
+echo "TIME:  $(date -Is)"
+
+# ---- your startup setup (same as your manual) ----
+module use /soft/modulefiles
+module load conda
+conda activate ssdp-paper
+
+export HF_HOME=/lus/grand/projects/VeloC/atkia/hf_cache
+export TRANSFORMERS_CACHE="$HF_HOME"
+export HF_HUB_CACHE="$HF_HOME"
+export HUGGINGFACE_HUB_CACHE="$HF_HOME"
+export HF_TOKEN="$(cat $HOME/.secrets/hf_token)"
+export HUGGINGFACE_HUB_TOKEN="$HF_TOKEN"
+
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+
+# Optional: avoid CPU thread wars when running 4 python procs
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+
+# ---- Option A behavior: start from scripts/ like you did manually ----
+REPO=/lus/grand/projects/VeloC/atkia/ssdp/SSDP
+cd "$REPO/scripts"
+echo "[PWD] $(pwd)"
+
+run_one () {
+  local gpu="$1"
+  local cfg_rel="$2"     # e.g., configs/inference/DPTS.json
+  local model="$3"       # e.g., llama-3b
+  local exp_name="$4"    # e.g., DPTS_MATH_llama-3b
+  local tag="$5"         # for log filename
+
+  local runlog="$LOGDIR/${tag}.${PBS_JOBID}.gpu${gpu}.log"
+
+  echo "[RUN] gpu=$gpu cfg=$cfg_rel model=$model exp=$exp_name log=$runlog at $(date -Is)"
+
+  (
+    # pin to one GPU
+    export CUDA_VISIBLE_DEVICES="$gpu"
+
+    # === these are the exact commands/structure you described ===
+    WORKSPACE=../
+    cd "$WORKSPACE"                 # from scripts/ -> repo root
+    export BENCHMARK_ROOT='./benchmark'
+
+    # (you had these exports; keep them)
+    export GPU=1                    # if your code uses it; otherwise harmless
+    export CUDA_DEVICE_ORDER=PCI_BUS_ID
+
+    work_dir=./results
+    mkdir -p "./results/${model}/${exp_name}"
+
+    trace_dir="./results/${model}/${exp_name}"
+
+    DATASET_NAME=math
+    MODEL_NAME="$model"
+    REWARD_MODEL=mistral_prm-7b
+
+    python3 -u main.py \
+      --config "$cfg_rel" \
+      --work-dir "$work_dir" \
+      --exp-name "$exp_name" \
+      --data "$DATASET_NAME" \
+      --model "$MODEL_NAME" \
+      --trace-log-dir "$trace_dir" \
+      --reward_model "$REWARD_MODEL" \
+      --dtype bfloat16 \
+      --fast_mode \
+      --debug
+  ) > "$runlog" 2>&1
+}
+
+# ---- 4 parallel runs: (llama-3b, llama-8b) x (DPTS, SSDP) ----
+run_one 0 "configs/inference/DPTS.json" "llama-3b" "DPTS_MATH_llama-3b" "llama-3b_DPTS" &
+PID0=$!
+#run_one 1 "configs/inference/SSDP.json" "llama-3b" "SSDP_MATH_llama-3b" "llama-3b_SSDP" &
+PID1=$!
+run_one 2 "configs/inference/DPTS.json" "llama-8b" "DPTS_MATH_llama-8b" "llama-8b_DPTS" &
+PID2=$!
+#run_one 3 "configs/inference/SSDP.json" "llama-8b" "SSDP_MATH_llama-8b" "llama-8b_SSDP" &
+PID3=$!
+
+echo "[PIDS] $PID0 $PID1 $PID2 $PID3"
+
+FAIL=0
+wait "$PID0" || FAIL=1
+wait "$PID1" || FAIL=1
+wait "$PID2" || FAIL=1
+wait "$PID3" || FAIL=1
+
+echo "[DONE] $(date -Is) fail=$FAIL"
+exit "$FAIL"

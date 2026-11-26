@@ -1,0 +1,97 @@
+#!/bin/bash -l
+#PBS -N dpts_math_8b
+#PBS -q preemptable
+#PBS -A VeloC
+#PBS -l select=2:system=polaris:ngpus=4
+#PBS -l walltime=10:00:00
+#PBS -l filesystems=home:grand:eagle
+#PBS -l place=scatter
+
+set -euo pipefail
+cd "$PBS_O_WORKDIR"
+
+module use /soft/modulefiles
+#module load conda
+#conda activate ssdp-paper
+
+export SSDP_ENV=/home/atkia/.conda/envs/ssdp-paper
+export PATH="$SSDP_ENV/bin:$PATH"
+hash -r
+
+
+export HF_HOME=/lus/grand/projects/VeloC/atkia/hf_cache
+export TRANSFORMERS_CACHE="$HF_HOME"; export HF_HUB_CACHE="$HF_HOME"; export HUGGINGFACE_HUB_CACHE="$HF_HOME"
+export HF_TOKEN="$(cat $HOME/.secrets/hf_token)"; export HUGGINGFACE_HUB_TOKEN="$HF_TOKEN"
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
+export SENTENCE_TRANSFORMERS_HOME=/lus/grand/projects/VeloC/atkia/hf_cache/sentence_transformers
+
+REPO=/lus/grand/projects/VeloC/atkia/ssdp/SSDP
+cd "$REPO"
+
+MODEL="llama-8b"                 # <-- your qwen prm run tag (match create_llm/create_prm)
+REWARD_MODEL="qwen_prm-7b"          # <-- match your qwen PRM key
+DATASET_NAME="math"             # <-- match supported_dataset key
+RESULTS="$REPO/results/dpts_qwen_math_8b"
+QDIR="$RESULTS/_queue/${MODEL}_${DATASET_NAME}"
+LOGDIR="$PBS_O_WORKDIR/runlogs"
+mkdir -p "$LOGDIR" "$QDIR/claim" "$QDIR/done"
+
+# ---- build the chunk list once (per-budget chunk sizes; tune to fit <1hr) ----
+if [[ ! -f "$QDIR/chunks.txt" ]]; then
+  SZ=100
+  N=500                              # <-- GSM8K test size (from the len() check above)
+  : > "$QDIR/chunks.txt"
+  for B in 3000 5000 8000 10000; do
+    s=0
+    while [ $s -lt $N ]; do           # <-- was: -lt 500
+      e=$(( s+SZ )); [ $e -gt $N ] && e=$N    # <-- was: -gt 500 ... =500
+      printf "b%05d_%03d %d %d %d\n" "$B" "$s" "$B" "$s" "$e" >> "$QDIR/chunks.txt"
+      s=$e
+    done
+  done
+  echo "[QUEUE] built $(wc -l < "$QDIR/chunks.txt") chunks"
+fi
+# no concurrent job (1-job/user limit) => safe to wipe stale claims, keep done markers
+rm -rf "$QDIR/claim"; mkdir -p "$QDIR/claim"
+
+cat > "$LOGDIR/launch_${PBS_JOBID}.sh" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+RANK="${PMI_RANK:-0}"; HOST="$(hostname)"; SLOT=$(( RANK % 2 ))
+cd "$REPO"
+export BENCHMARK_ROOT='./benchmark' CUDA_DEVICE_ORDER=PCI_BUS_ID
+if   [[ "$SLOT" == "0" ]]; then export CUDA_VISIBLE_DEVICES=0,1
+elif [[ "$SLOT" == "1" ]]; then export CUDA_VISIBLE_DEVICES=2,3
+else echo "[ERR] SLOT=$SLOT on $HOST"; exit 1; fi
+
+export SSDP_WORKER_RANK="$RANK"          # capture BEFORE unsetting MPI vars
+export SSDP_QDIR="$QDIR" SSDP_RESULTS="$RESULTS"
+export SSDP_DEADLINE_S=$((24*3600 + 30*60))
+export SSDP_MIN_LEFT_S=1800
+
+# hide the multinode launch from Accelerate (same as your old script)
+unset PMI_RANK PMI_SIZE PMI_FD PMIX_RANK PMIX_SERVER_URI2 PMIX_SERVER_URI3
+unset OMPI_COMM_WORLD_RANK OMPI_COMM_WORLD_SIZE OMPI_COMM_WORLD_LOCAL_RANK
+unset MPI_LOCALRANKID MPI_LOCALNRANKS MPICH_RANK MPICH_LOCAL_RANK MPICH_WORLD_SIZE
+unset MASTER_ADDR MASTER_PORT RANK WORLD_SIZE LOCAL_RANK
+
+RUNLOG="$LOGDIR/w${SSDP_WORKER_RANK}.${PBS_JOBID}.${HOST}.log"
+{
+  echo "[START] $(date -Is) host=$HOST rank=$SSDP_WORKER_RANK gpus=$CUDA_VISIBLE_DEVICES"
+  python3 -u main.py \
+    --config configs/inference/DPTS.json \
+    --work-dir "$RESULTS" \
+    --data "$DATASET_NAME" \
+    --model "$MODEL" \
+    --reward_model "$REWARD_MODEL" \
+    --dtype bfloat16
+  echo "[END] $(date -Is) rc=$?"
+} > "$RUNLOG" 2>&1
+EOF
+chmod +x "$LOGDIR/launch_${PBS_JOBID}.sh"
+
+export REPO LOGDIR QDIR RESULTS MODEL REWARD_MODEL DATASET_NAME
+echo "[LAUNCH] 4 workers (2 nodes x 2), shared queue at $QDIR"
+mpiexec -n 4 --ppn 2 "$LOGDIR/launch_${PBS_JOBID}.sh"
+echo "[DONE] $(date -Is)"

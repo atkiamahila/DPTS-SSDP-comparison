@@ -1,0 +1,82 @@
+[
+  {
+    "summary_path": "/lus/grand/projects/VeloC/atkia/ssdp/SSDP/results/llama-3b/DPTS_MATH_llama-3b/6950854.polaris-pbs-01.hsn.cm.polaris.alcf.anl.gov_traces/job_summary_topk_tokens.json",
+    "reason": "job_id_not_in_math_mapping"
+  },
+  {
+    "summary_path": "/lus/grand/projects/VeloC/atkia/ssdp/SSDP/results/llama-3b/DPTS_MATH_llama-3b/6955732.polaris-pbs-01.hsn.cm.polaris.alcf.anl.gov_traces/job_summary_topk_tokens.json",
+    "reason": "job_id_not_in_math_mapping"
+  },
+  {
+    "summary_path": "/lus/grand/projects/VeloC/atkia/ssdp/SSDP/results/llama-3b/DPTS_MATH_llama-3b/6956211.polaris-pbs-01.hsn.cm.polaris.alcf.anl.gov_traces/job_summary_topk_tokens.json",
+    "reason": "job_id_not_in_math_mapping"
+  },
+  {
+    "summary_path": "/lus/grand/projects/VeloC/atkia/ssdp/SSDP/results/llama-3b/DPTS_MATH_llama-3b/6956478.polaris-pbs-01.hsn.cm.polaris.alcf.anl.gov_traces/job_summary_topk_tokens.json",
+    "reason": "job_id_not_in_math_mapping"
+  },
+  {
+    "summary_path": "/lus/grand/projects/VeloC/atkia/ssdp/SSDP/results/llama-3b/DPTS_gsm_llama-3b/6957143.polaris-pbs-01.hsn.cm.polaris.alcf.anl.gov_traces/job_summary_topk_tokens.json",
+    "reason": "job_id_not_in_gsm_mapping"
+  },
+  {
+    "summary_path": "/lus/grand/projects/VeloC/atkia/ssdp/SSDP/results/llama-3b/SSDP_MATH_llama-3b/6950854.polaris-pbs-01.hsn.cm.polaris.alcf.anl.gov_traces/job_summary_topk_tokens.json",
+    "reason": "job_id_not_in_math_mapping"
+  },
+  {
+    "summary_path": "/lus/grand/projects/VeloC/atkia/ssdp/SSDP/results/llama-3b/SSDP_MATH_llama-3b/6955732.polaris-pbs-01.hsn.cm.polaris.alcf.anl.gov_traces/job_summary_topk_tokens.json",
+    "reason": "job_id_not_in_math_mapping"
+  },
+  {
+    "summary_path": "/lus/grand/projects/VeloC/atkia/ssdp/SSDP/results/llama-3b/SSDP_MATH_llama-3b/6956211.polaris-pbs-01.hsn.cm.polaris.alcf.anl.gov_traces/job_summary_topk_tokens.json",
+    "reason": "job_id_not_in_math_mapping"
+  },
+  {
+    "summary_path": "/lus/grand/projects/VeloC/atkia/ssdp/SSDP/results/llama-3b/SSDP_MATH_llama-3b/6956478.polaris-pbs-01.hsn.cm.polaris.alcf.anl.gov_traces/job_summary_topk_tokens.json",
+    "reason": "job_id_not_in_math_mapping"
+  },
+  {
+    "summary_path": "/lus/grand/projects/VeloC/atkia/ssdp/SSDP/results/llama-3b/SSDP_gsm_llama-3b/6957143.polaris-pbs-01.hsn.cm.polaris.alcf.anl.gov_traces/job_summary_topk_tokens.json",
+    "reason": "job_id_not_in_gsm_mapping"
+  },
+  {
+    "summary_path": "/lus/grand/projects/VeloC/atkia/ssdp/SSDP/results/llama-8b/DPTS_MATH_llama-8b/6950854.polaris-pbs-01.hsn.cm.polaris.alcf.anl.gov_traces/job_summary_topk_tokens.json",
+    "reason": "job_id_not_in_math_mapping"
+  },
+  {
+    "summary_path": "/lus/grand/projects/VeloC/atkia/ssdp/SSDP/results/llama-8b/DPTS_MATH_llama-8b/6955732.polaris-pbs-01.hsn.cm.polaris.alcf.anl.gov_traces/job_summary_topk_tokens.json",
+    "reason": "job_id_not_in_math_mapping"
+  },
+  {
+    "summary_path": "/lus/grand/projects/VeloC/atkia/ssdp/SSDP/results/llama-8b/DPTS_MATH_llama-8b/6956211.polaris-pbs-01.hsn.cm.polaris.alcf.anl.gov_traces/job_summary_topk_tokens.json",
+    "reason": "job_id_not_in_math_mapping"
+  },
+  {
+    "summary_path": "/lus/grand/projects/VeloC/atkia/ssdp/SSDP/results/llama-8b/DPTS_MATH_llama-8b/6956478.polaris-pbs-01.hsn.cm.polaris.alcf.anl.gov_traces/job_summary_topk_tokens.json",
+    "reason": "job_id_not_in_math_mapping"
+  },
+  {
+    "summary_path": "/lus/grand/projects/VeloC/atkia/ssdp/SSDP/results/llama-8b/DPTS_gsm_llama-8b/6957143.polaris-pbs-01.hsn.cm.polaris.alcf.anl.gov_traces/job_summary_topk_tokens.json",
+    "reason": "job_id_not_in_gsm_mapping"
+  },
+  {
+    "summary_path": "/lus/grand/projects/VeloC/atkia/ssdp/SSDP/results/llama-8b/SSDP_MATH_llama-8b/6950854.polaris-pbs-01.hsn.cm.polaris.alcf.anl.gov_traces/job_summary_topk_tokens.json",
+    "reason": "job_id_not_in_math_mapping"
+  },
+  {
+    "summary_path": "/lus/grand/projects/VeloC/atkia/ssdp/SSDP/results/llama-8b/SSDP_MATH_llama-8b/6955732.polaris-pbs-01.hsn.cm.polaris.alcf.anl.gov_traces/job_summary_topk_tokens.json",
+    "reason": "job_id_not_in_math_mapping"
+  },
+  {
+    "summary_path": "/lus/grand/projects/VeloC/atkia/ssdp/SSDP/results/llama-8b/SSDP_MATH_llama-8b/6956211.polaris-pbs-01.hsn.cm.polaris.alcf.anl.gov_traces/job_summary_topk_tokens.json",
+    "reason": "job_id_not_in_math_mapping"
+  },
+  {
+    "summary_path": "/lus/grand/projects/VeloC/atkia/ssdp/SSDP/results/llama-8b/SSDP_MATH_llama-8b/6956478.polaris-pbs-01.hsn.cm.polaris.alcf.anl.gov_traces/job_summary_topk_tokens.json",
+    "reason": "job_id_not_in_math_mapping"
+  },
+  {
+    "summary_path": "/lus/grand/projects/VeloC/atkia/ssdp/SSDP/results/llama-8b/SSDP_gsm_llama-8b/6957143.polaris-pbs-01.hsn.cm.polaris.alcf.anl.gov_traces/job_summary_topk_tokens.json",
+    "reason": "job_id_not_in_gsm_mapping"
+  }
+]
